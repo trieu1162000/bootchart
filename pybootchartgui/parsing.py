@@ -421,29 +421,92 @@ def _parse_taskstats_log(writer, file):
     return ProcessStats (writer, processMap, len (timed_blocks), avgSampleLength, startTime, ltime)
 
 def _parse_proc_stat_log(file):
-    samples = []
-    ltimes = None
+    """Parse /proc/stat samples.
+
+    Historically this returned only overall CPU utilization samples based on
+    the first 'cpu' line. This function now also parses per-core lines
+    (cpu0, cpu1, ...).
+
+    Return value (backwards compatible):
+      - If only the aggregate 'cpu' line is found: List[CPUSample]
+      - Otherwise: {'all': List[CPUSample], 'per_cpu': Dict[int, List[CPUSample]]}
+    """
+    all_samples = []
+    per_cpu_samples = defaultdict(list)
+
+    # last observed raw times
+    last_all = None
+    last_per_cpu = {}
+
     for time, lines in _parse_timed_blocks(file):
-        # skip emtpy lines
         if not lines:
             continue
-        tokens = lines[0].split()
-        if len(tokens) < 8:
+
+        # Find all cpu lines in this block. Format:
+        # cpu  user nice system idle iowait irq softirq [steal [guest [guest_nice]]]
+        cpu_lines = []
+        for line in lines:
+            if not line:
+                continue
+            if line.startswith('cpu'):
+                cpu_lines.append(line)
+
+        if not cpu_lines:
             continue
-        # CPU times {user, nice, system, idle, io_wait, irq, softirq}
-        times = [ int(token) for token in tokens[1:] ]
-        if ltimes:
-            user = float((times[0] + times[1]) - (ltimes[0] + ltimes[1]))
-            system = float((times[2] + times[5] + times[6]) - (ltimes[2] + ltimes[5] + ltimes[6]))
-            idle = float(times[3] - ltimes[3])
-            iowait = float(times[4] - ltimes[4])
 
-            aSum = max(user + system + idle + iowait, 1)
-            samples.append( CPUSample(time, user/aSum, system/aSum, iowait/aSum) )
+        def to_times(tokens):
+            # Need at least user..softirq
+            if len(tokens) < 8:
+                return None
+            try:
+                return [int(t) for t in tokens[1:]]
+            except ValueError:
+                return None
 
-        ltimes = times
-        # skip the rest of statistics lines
-    return samples
+        def mk_sample(now, prev):
+            user = float((now[0] + now[1]) - (prev[0] + prev[1]))
+            system = float((now[2] + now[5] + now[6]) - (prev[2] + prev[5] + prev[6]))
+            idle = float(now[3] - prev[3])
+            iowait = float(now[4] - prev[4])
+            aSum = max(user + system + idle + iowait, 1.0)
+            return CPUSample(time, user / aSum, system / aSum, iowait / aSum)
+
+        # Parse aggregate line (exactly 'cpu') if present
+        for line in cpu_lines:
+            tokens = line.split()
+            if not tokens:
+                continue
+            name = tokens[0]
+            if name == 'cpu':
+                now = to_times(tokens)
+                if now is None:
+                    continue
+                if last_all is not None:
+                    all_samples.append(mk_sample(now, last_all))
+                last_all = now
+                break
+
+        # Parse per-core lines
+        for line in cpu_lines:
+            tokens = line.split()
+            if not tokens:
+                continue
+            name = tokens[0]
+            if len(name) > 3 and name.startswith('cpu') and name[3:].isdigit():
+                idx = int(name[3:])
+                now = to_times(tokens)
+                if now is None:
+                    continue
+                prev = last_per_cpu.get(idx)
+                if prev is not None:
+                    per_cpu_samples[idx].append(mk_sample(now, prev))
+                last_per_cpu[idx] = now
+
+    # Backwards compatibility: old code expects a list of CPUSample
+    if not per_cpu_samples:
+        return all_samples
+
+    return {'all': all_samples, 'per_cpu': dict(per_cpu_samples)}
 
 def _parse_proc_disk_stat_log(file, numCpu):
     """
@@ -451,7 +514,7 @@ def _parse_proc_disk_stat_log(file, numCpu):
     not sda1, sda2 etc. The format of relevant lines should be:
     {major minor name rio rmerge rsect ruse wio wmerge wsect wuse running use aveq}
     """
-    disk_regex_re = re.compile ('^([hsv]d.|mtdblock\d|mmcblk\d|cciss/c\d+d\d+.*)$')
+    disk_regex_re = re.compile (r'^([hsv]d.|mtdblock\d|mmcblk\d|cciss/c\d+d\d+.*)$')
 
     # this gets called an awful lot.
     def is_relevant_line(linetokens):
@@ -520,8 +583,8 @@ def _parse_proc_meminfo_log(file):
 # [    0.039993] calling  migration_init+0x0/0x6b @ 1
 # [    0.039993] initcall migration_init+0x0/0x6b returned 1 after 0 usecs
 def _parse_dmesg(writer, file):
-    timestamp_re = re.compile ("^\[\s*(\d+\.\d+)\s*]\s+(.*)$")
-    split_re = re.compile ("^(\S+)\s+([\S\+_-]+) (.*)$")
+    timestamp_re = re.compile (r"^\[\s*(\d+\.\d+)\s*]\s+(.*)$")
+    split_re = re.compile (r"^(\S+)\s+([\S\+_-]+) (.*)$")
     processMap = {}
     idx = 0
     inc = 1.0 / 1000000
@@ -566,7 +629,7 @@ def _parse_dmesg(writer, file):
 #               print "foo: '%s' '%s' '%s'" % (type, func, rest)
         if type == "calling":
             ppid = kernel.pid
-            p = re.match ("\@ (\d+)", rest)
+            p = re.match (r"\@ (\d+)", rest)
             if p is not None:
                 ppid = float (p.group(1)) // 1000
 #                               print "match: '%s' ('%g') at '%s'" % (func, ppid, time_ms)
